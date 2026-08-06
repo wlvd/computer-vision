@@ -17,9 +17,14 @@ ARC_FACE_TEMPLATE = np.array([
     [70.7299, 92.2041]  # Colt gura dreapta
 ], dtype=np.float32)
 
-#Initializam modelele delegand calculele catre TensorRT
-landmark_session = ort.InferenceSession("/workspace/_landmark/2d106det.onnx", providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider'])
-face_rec_session = ort.InferenceSession("/workspace/_landmark/w600k_mbf.onnx", providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider'])
+# Creăm niște opțiuni de sesiune pentru a evita avertismentele de thread-uri
+so = ort.SessionOptions()
+so.intra_op_num_threads = 1
+so.inter_op_num_threads = 1
+
+# Inițializăm modelele adăugând variabila sess_options=so
+landmark_session = ort.InferenceSession("/workspace/_landmark/2d106det.onnx", sess_options=so, providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider'])
+face_rec_session = ort.InferenceSession("/workspace/_landmark/w600k_mbf.onnx", sess_options=so, providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider'])
 
 # Baza de date in-memory
 baza_de_date_test = {}
@@ -67,7 +72,10 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
             break
             
         # Extragem pixelii imaginii din memoria GPU in Python folosind pyds
-        n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+        n_frame_rgba = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+        
+        # TRANSFORMARE OBLIGATORIE DIN RGBA IN RGB (4 canale -> 3 canale)
+        n_frame = cv2.cvtColor(n_frame_rgba, cv2.COLOR_RGBA2RGB)
         
         l_obj = frame_meta.obj_meta_list
         while l_obj is not None:
@@ -79,12 +87,17 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
             # Verifica daca obiectul e clasa corecta din YOLO (ex: 0 pentru fata)
             if obj_meta.class_id == 0:
                 rect = obj_meta.rect_params
-                x1, y1 = int(rect.left), int(rect.top)
                 w, h = int(rect.width), int(rect.height)
                 
-                # Decupam cu grija marginile pt a nu iesi din limitele array-ului
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(n_frame.shape[1], x1 + w), min(n_frame.shape[0], y1 + h)
+                # Adaugam un padding de 10% pentru modelul de landmarks
+                margin_x = int(w * 0.1)
+                margin_y = int(h * 0.1)
+                
+                x1 = max(0, int(rect.left) - margin_x)
+                y1 = max(0, int(rect.top) - margin_y)
+                x2 = min(n_frame.shape[1], int(rect.left) + w + margin_x)
+                y2 = min(n_frame.shape[0], int(rect.top) + h + margin_y)
+                
                 face_crop = n_frame[y1:y2, x1:x2]
                 
                 if face_crop.size != 0:
@@ -152,14 +165,12 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
                     obj_meta.text_params.text_bg_clr.green = 0.0
                     obj_meta.text_params.text_bg_clr.blue = 0.0
                     obj_meta.text_params.text_bg_clr.alpha = 0.5 
-                    # Schimbam textul sa arate si ID-ul de tracking
-                    obj_meta.text_params.display_text = f"Persoana_{obj_meta.object_id}"
                     
             try:
                 l_obj = l_obj.next
             except StopIteration:
                 break
-                
+        pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)                
         try:
             l_frame = l_frame.next
         except StopIteration:
@@ -176,8 +187,10 @@ def main():
 
     caps_v4l2 = Gst.ElementFactory.make("capsfilter", "v4l2-caps")
     caps_v4l2.set_property('caps', Gst.Caps.from_string("image/jpeg, width=1920, height=1080, framerate=30/1"))
+    
+    jpegparse = Gst.ElementFactory.make("jpegparse", "jpeg-parser")
 
-    jpegdec = Gst.ElementFactory.make("jpegdec", "jpeg-decoder")
+    jpegdec = Gst.ElementFactory.make("nvjpegdec", "jpeg-decoder")
     
     vidconv1 = Gst.ElementFactory.make("nvvideoconvert", "converter1")
     caps_vidconv = Gst.ElementFactory.make("capsfilter", "nvmm-caps")
@@ -213,12 +226,13 @@ def main():
     else:
         osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, 0)
 
-    elements = [source, caps_v4l2, jpegdec, vidconv1, caps_vidconv, streammux, pgie, tracker, vidconv2, nvosd, transform, sink]
+    elements = [source, caps_v4l2, jpegparse ,jpegdec, vidconv1, caps_vidconv, streammux, tracker, pgie, vidconv2, nvosd, transform, sink]
     for el in elements:
         pipeline.add(el)
 
     source.link(caps_v4l2)
-    caps_v4l2.link(jpegdec)
+    caps_v4l2.link(jpegparse)
+    jpegparse.link(jpegdec)
     jpegdec.link(vidconv1)
     vidconv1.link(caps_vidconv)
 
