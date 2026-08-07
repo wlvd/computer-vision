@@ -23,7 +23,9 @@ def main():
     caps_v4l2.set_property('caps', Gst.Caps.from_string("image/jpeg, width=1920, height=1080, framerate=30/1"))
 
     #Decodam MJPG-ul in format video brut
-    jpegdec = Gst.ElementFactory.make("jpegdec", "jpeg-decoder")
+    #jpegdec = Gst.ElementFactory.make("jpegdec", "jpeg-decoder")
+    jpegdec = Gst.ElementFactory.make("nvv4l2decoder", "jpeg-decoder")
+    jpegdec.set_property("mjpeg", 1)
 
     #Convertim in memoria GPU (NVMM) pe care o cere DeepStream
     vidconv1 = Gst.ElementFactory.make("nvvideoconvert", "converter1")
@@ -41,7 +43,7 @@ def main():
     pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
 
     pgie.set_property('config-file-path', "config_infer_best_v2.txt")
-
+    pgie.set_property('interval', 2)
     #Tracker IOU (asociere pe suprapunerea bounding box-urilor intre frame-uri)
     tracker = Gst.ElementFactory.make("nvtracker", "tracker")
     tracker.set_property('tracker-width', 640)

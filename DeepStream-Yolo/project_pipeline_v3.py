@@ -29,9 +29,9 @@ def main():
     # 2. Inițializare modele ONNX (Asigură-te că folosești CUDA/TensorRT)
     providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
     
-    session_yolo = ort.InferenceSession("yolo_face_detection.onnx", providers=providers)
-    session_106 = ort.InferenceSession("2d106fdet.onnx", providers=providers)
-    session_w600k = ort.InferenceSession("w600k_mbf.onnx", providers=providers)
+    session_yolo = ort.InferenceSession("/workspace/v2/best.onnx", providers=providers)
+    session_106 = ort.InferenceSession("/workspace/_landmark/2d106det.onnx", providers=providers)
+    session_w600k = ort.InferenceSession("/workspace/_landmark/w600k_mbf.onnx", providers=providers)
     
     # 3. Inițializare Tracker Python (înlocuitorul logic pentru nvtracker aici)
     tracker = Sort(max_age=30, min_hits=3, iou_threshold=0.3)
@@ -41,9 +41,9 @@ def main():
     gst_pipeline = (
         "v4l2src device=/dev/video0 ! "
         "image/jpeg, width=1280, height=720, framerate=30/1 ! "
-        "nvjpegdec ! video/x-raw ! nvvidconv ! "
+        "nvjpegdec ! nvvidconv ! "
         "video/x-raw, format=BGRx ! videoconvert ! "
-        "video/x-raw, format=BGR ! appsink drop=1"
+        "video/x-raw, format=BGR ! appsink"
     )
     
     cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
@@ -61,7 +61,7 @@ def main():
             
         # --- A. DETECȚIE YOLO ---
         # (Preprocesare sumară: depinde de input-ul cerut de YOLO-ul tău - ex: 640x640)
-        input_yolo = cv2.resize(frame, (640, 640))
+        input_yolo = cv2.resize(frame, (960, 960))
         input_yolo = input_yolo.transpose(2, 0, 1).astype(np.float32) / 255.0
         input_yolo = np.expand_dims(input_yolo, axis=0)
         
