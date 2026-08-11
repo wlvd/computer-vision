@@ -7,7 +7,7 @@ import onnxruntime as ort
 MODEL_PATH = "/workspace/_landmark/pfld.onnx"
 INPUT_DIR = "/workspace/output_crops"
 OUTPUT_DIR = "/workspace/output_landmarks"
-MAX_IMAGES = 15  # testam doar pe un esantion, nu pe tot folderul
+MAX_IMAGES = 80  # testam doar pe un esantion, nu pe tot folderul
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

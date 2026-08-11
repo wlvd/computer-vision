@@ -7,7 +7,7 @@ import onnxruntime as ort
 MODEL_PATH = "/workspace/_landmark/pfld.onnx"
 INPUT_DIR = "/workspace/output_crops"
 ALIGNED_OUTPUT_DIR = "/workspace/output_aligned"
-MAX_IMAGES = 15
+MAX_IMAGES = 80
 
 os.makedirs(ALIGNED_OUTPUT_DIR, exist_ok=True)
 
