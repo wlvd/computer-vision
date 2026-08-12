@@ -19,11 +19,14 @@ import pycuda.driver as cuda
 # CONFIGURARE
 # ============================================================
 
+if not hasattr(np, "bool"):
+    np.bool = bool
+
 YOLO_CONFIG_PATH = "config_infer_best_v2.txt"
 TRACKER_CONFIG_PATH = "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml"
 
-PFLD_MODEL_PATH = "/workspace/_landmark/pfld.engine"
-RECOGNITION_MODEL_PATH = "/workspace/_landmark/w600k_mbf.engine"
+PFLD_MODEL_PATH = "/workspace/DeepStream-Yolo/pfld.engine"
+RECOGNITION_MODEL_PATH = "/workspace/DeepStream-Yolo/w600k_mbf.engine"
 FACE_DATABASE_PATH = "/workspace/DeepStream-Yolo/face_database.json"
 
 MIN_CONFIDENCE = 0.5          # sub asta, nici nu incercam sa procesam fata
@@ -48,7 +51,7 @@ AUTO_ENROLL = True
 ENROLL_MAX_SCORE = 0.32       # peste asta seamana prea mult cu cineva existent ca sa fie "nou"
 ENROLL_MIN_CHECKS = 4         # de cate ori la rand trebuie sa iasa "necunoscut"
 ENROLL_MIN_FACE = 90          # px, mai strict decat MIN_FACE_SIZE: inrolam doar fete mari
-ENROLL_MIN_BLUR = 250.0       # la fel, mai strict decat poarta de recunoastere
+ENROLL_MIN_BLUR = 110.0       # la fel, mai strict decat poarta de recunoastere
 DB_SAVE_INTERVAL_FRAMES = 300 # cat de des scriem baza de date pe disc
 
 ARCFACE_TEMPLATE = np.array([
@@ -460,6 +463,11 @@ def full_pipeline_probe(pad, info, u_data):
                             if (AUTO_ENROLL and label == "necunoscut"
                                     and not state.enrolled):
                                 state.unknown_streak += 1
+                                print(f"[DEBUG ENROLL] track {track_id}: "
+                                      f"streak={state.unknown_streak}/{ENROLL_MIN_CHECKS} "
+                                      f"score={score:.3f} (nevoie <{ENROLL_MAX_SCORE}) "
+                                      f"size={min(w, h)}px (nevoie >={ENROLL_MIN_FACE}) "
+                                      f"blur={b_score:.1f} (nevoie >={ENROLL_MIN_BLUR})")
                                 if (state.unknown_streak >= ENROLL_MIN_CHECKS
                                         and score < ENROLL_MAX_SCORE
                                         and min(w, h) >= ENROLL_MIN_FACE
