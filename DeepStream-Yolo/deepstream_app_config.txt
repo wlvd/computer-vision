@@ -13,14 +13,14 @@ nvbuf-memory-type=0
 
 [source0]
 enable=1
-type=1 #3=video 1=camera
-#uri=file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4
-camera-width=1920
-camera-height=1080
-camera-fps-n=30
-camera-fps-d=1
-camera-v4l2-dev-node=0
-num-sources=1
+type=3 #3=video 1=camera
+uri=file:///workspace/DeepStream-Yolo/256701/256701_adnotat.mp4
+#camera-width=1920
+#camera-height=1080
+#camera-fps-n=30
+#camera-fps-d=1
+#camera-v4l2-dev-node=0
+#num-sources=1
 gpu-id=0
 cudadec-memtype=0
 
@@ -57,7 +57,7 @@ enable-padding=0
 nvbuf-memory-type=0
 
 [primary-gie]
-enable=1
+enable=0
 gpu-id=0
 gie-unique-id=1
 nvbuf-memory-type=0
