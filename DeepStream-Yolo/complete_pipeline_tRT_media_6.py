@@ -78,8 +78,8 @@ RECOGNITION_MODEL_PATH = "/workspace/DeepStream-Yolo/w600k_mbf.engine"
 FACE_DATABASE_PATH = "/workspace/DeepStream-Yolo/face_database.json"
 
 MIN_CONFIDENCE = 0.5          # sub asta, nici nu incercam sa procesam fata
-MIN_FACE_SIZE = 30            # px, latura minima a bbox-ului
-MIN_BLUR = 60.0              # varianta Laplacianului la care consideram poza clara
+MIN_FACE_SIZE = 40            # px, latura minima a bbox-ului
+MIN_BLUR = 100.0              # varianta Laplacianului la care consideram poza clara
 
 # Varianta live arunca proba daca blur < MIN_BLUR. Aici nu: pe fisier, varianta
 # Laplacianului depinde de codec si de scalarea la rezolutia de lucru (un clip
@@ -108,7 +108,7 @@ QUALITY_MIN = 0.30            # sub asta nu merita consumat modelul de recunoast
 
 QUALITY_WEIGHTS = {"yaw": 0.30, "pitch": 0.20, "roll": 0.10, "sharp": 0.20, "size": 0.20}
 
-VERIFY_THRESHOLD = 0.42       # prag empiric, ajustat pe baza testelor offline
+VERIFY_THRESHOLD = 0.45       # prag empiric, ajustat pe baza testelor offline
 
 AUTO_ENROLL = True
 ENROLL_MARGIN = 0.10          # banda de incertitudine sub pragul de recunoastere
@@ -122,7 +122,7 @@ ENROLL_MAX_SCORE = VERIFY_THRESHOLD - ENROLL_MARGIN
 # calibrate pe camera 1080p taiau tot pe fisierele de test. Toate se pot schimba
 # din linia de comanda (--enroll-min-face, --enroll-min-blur, ...).
 ENROLL_MIN_CHECKS = 2         # 3 cerea ~45 de cadre de track neintrerupt; nu exista
-ENROLL_MIN_FACE = 35
+ENROLL_MIN_FACE = 50
 
 # Cea mai importanta poarta pentru ce ajunge in baza, si singura care nu se poate
 # compensa. Masurat pe sample_vid.mp4: prototipurile cu frontalitate 0 au dat
@@ -131,7 +131,7 @@ ENROLL_MIN_FACE = 35
 # si 0.52 au dat 0.80 si 0.85. Pragul taie exact profilurile, fara sa ceara poze
 # de buletin: 40% din fetele clipului au frontalitate 0.
 ENROLL_MIN_FRONTALITY = 0.15
-ENROLL_MIN_BLUR = 60.0
+ENROLL_MIN_BLUR = 80.0
 ENROLL_MIN_QUALITY = 0.35
 
 LABEL_UNKNOWN = "necunoscut"

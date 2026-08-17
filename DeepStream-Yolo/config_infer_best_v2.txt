@@ -16,12 +16,12 @@ network-type=0
 cluster-mode=4
 maintain-aspect-ratio=1
 symmetric-padding=1
-workspace-size=1500
+workspace-size=1300
 parse-bbox-func-name=NvDsInferParseYolo
 #parse-bbox-func-name=NvDsInferParseYoloCuda
 custom-lib-path=nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 engine-create-func-name=NvDsInferYoloCudaEngineGet
 
 [class-attrs-all]
-pre-cluster-threshold=0.25
+pre-cluster-threshold=0.4
 topk=300
