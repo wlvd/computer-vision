@@ -27,6 +27,44 @@ Utilizare:
 
 Numele videoclipului se cauta, in ordine: asa cum a fost dat, langa script, si
 in subfolderul sample/ de langa script.
+
+Despre viteza. Masurat pe videotest3.mp4 (1080x1920, cadru larg): 711 cadre in
+71.6 s, adica 9.9 FPS, cu 43.3 ms in probe (fix 24.8 ms/cadru + 4.3 ms/fata, la
+4 fete pe cadru) si ~57 ms in restul pipeline-ului. Detectorul scotea 42 de
+casete pe cadru, din care 38 sub pragul de marime -- si toate 38 erau urmarite
+de tracker si scrise in log. Ce s-a facut, in ordinea castigului:
+
+  1. queue-uri intre elemente. Fara ele tot pipeline-ul rula pe UN SINGUR fir,
+     deci cele 43 ms de probe se adunau la cele 57 ms de decodare/detectie/
+     encodare in loc sa se suprapuna cu ele.
+  2. casetele care nu pot trece de porti se sterg INAINTE de tracker, nu dupa:
+     NvDCF filtra 42 de tinte pe cadru ca sa foloseasca 4.
+  3. din suprafata se copiaza doar crop-urile fetelor, nu tot cadrul: 4 bucati
+     de ~5 KB in loc de 14 MB de copiat si convertit pe fiecare cadru.
+  4. punctele se deseneaza vectorizat (o scriere numpy), nu cu 424 de apeluri
+     cv2.circle pe cadru.
+  5. respinsele se numara, nu se scriu una cate una: 69% din log erau ele.
+
+Primele cinci nu ating deciziile de recunoastere: aceleasi cadre, aceleasi probe,
+aceleasi etichete. A sasea, in schimb, e o alegere, nu o optimizare curata:
+
+  6. RACIREA. Dupa ce un track are identitate confirmata, nu i se mai cer
+     landmark-uri pe fiecare cadru, ci doar in fereastra dinaintea urmatoarei
+     verificari, iar verificarile lui se rarese de la 10 la
+     IDENTIFIED_INTERVAL_FRAMES cadre. Landmark-urile erau 63% din timpul de
+     probe, si pe un clip cu oameni deja in baza aproape toate se calculau pentru
+     oameni pe care ii stiam deja. Simulat pe videotest3.mp4, la o a doua rulare
+     (baza plina): 4.0 -> 0.5 fete cu landmark pe cadru, 86% economisit.
+
+     Ce se plateste: daca tracker-ul schimba persoana sub acelasi id in timpul
+     racirii, eticheta gresita ramane pana la urmatoarea verificare. Si nu se mai
+     deseneaza punctele pe oamenii recunoscuti -- caseta si eticheta raman, ele
+     merg prin metadate. Inrolarea NU e atinsa: un track fara identitate primeste
+     landmark-uri pe fiecare cadru, ca inainte, pentru ca din ele se alege
+     prototipul. Se dezactiveaza cu --landmark-all.
+
+Ce se masoara efectiv se vede in summary.json, la "viteza", "timp_etape_ms" si
+"apeluri_economisite".
 """
 
 import argparse
@@ -80,7 +118,24 @@ FACE_DATABASE_PATH = "/workspace/DeepStream-Yolo/face_database.json"
 
 MIN_CONFIDENCE = 0.5          # sub asta, nici nu incercam sa procesam fata
 MIN_FACE_SIZE = 40            # px, latura minima a bbox-ului
-MIN_BLUR = 60.0              # varianta Laplacianului la care consideram poza clara
+MIN_BLUR = 80.0              # varianta Laplacianului la care consideram poza clara
+
+# Casetele care nu pot trece niciodata de porti se sterg din metadate imediat
+# dupa detector, deci tracker-ul nici nu le vede. Masurat pe videotest3.mp4: 42
+# de casete pe cadru, din care 4 treceau -- NvDCF facea urmarire prin corelatie
+# pentru 38 de casete degeaba, pe fiecare cadru.
+#
+# Pragul de aici e mai jos decat MIN_FACE_SIZE, cu factorul de mai jos, si asta
+# e intentionat: o fata care oscileaza in jurul pragului trebuie sa-si pastreze
+# track-ul si in cadrele in care e cu un pixel prea mica, altfel primeste alt id
+# la fiecare oscilatie si nu aduna niciodata ENROLL_MIN_CHECKS verificari.
+PRETRACK_FILTER = True
+PRETRACK_SIZE_FACTOR = 0.8
+PRETRACK_MIN_SIZE = MIN_FACE_SIZE * PRETRACK_SIZE_FACTOR   # recalculat in apply_thresholds
+
+# Detaliul fiecarei casete respinse in log. Implicit doar numarate pe poarta:
+# vezi comentariul din process_frame.
+LOG_REJECTED = False
 
 # Varianta live arunca proba daca blur < MIN_BLUR. Aici nu: pe fisier, varianta
 # Laplacianului depinde de codec si de scalarea la rezolutia de lucru (un clip
@@ -96,8 +151,20 @@ BLUR_REJECT_FACTOR = 0.25     # probe cu blur < MIN_BLUR * factor se arunca
 # de cadre. La o verificare pe 15 cadre, majoritatea apuca una singura, deci nu
 # ajung niciodata la ENROLL_MIN_CHECKS. Costul e mic (recunoasterea a insemnat 15
 # apeluri in tot clipul), asa ca verificam mai des.
-VERIFY_INTERVAL_FRAMES = 15   # la cat timp cel mult re-verificam un track activ
-RETRY_INTERVAL_ON_FAIL = 7    # daca poarta de calitate a picat, reincercam mai repede
+VERIFY_INTERVAL_FRAMES = 20   # la cat timp cel mult re-verificam un track activ
+RETRY_INTERVAL_ON_FAIL = 10    # daca poarta de calitate a picat, reincercam mai repede
+
+# Cadenta pentru track-urile care AU deja o identitate confirmata. Odata ce stim
+# cine e cineva, tot ce mai facem cu el e sa ne asiguram ca tracker-ul nu ne-a
+# schimbat omul sub acelasi id -- si asta nu cere o verificare la 10 cadre.
+# Masurat pe videotest3.mp4: 4 fete pe cadru, landmark-urile 18.1 ms din 28.9 ms
+# de probe, adica 63% din tot ce se calculeaza pe cadru mergea pe oameni deja
+# recunoscuti. La 30 de cadre (~1.2 s la 25 FPS) ramane destul de des cat sa
+# prindem un id schimbat, dar de trei ori mai rar.
+#
+# Riscul, explicit: daca tracker-ul schimba persoana sub acelasi id in timpul
+# racirii, eticheta gresita ramane afisata pana la urmatoarea verificare.
+IDENTIFIED_INTERVAL_FRAMES = 30
 LABEL_HISTORY_SIZE = 5        # cate decizii recente pastram pentru vot majoritar
 TRACK_TIMEOUT_FRAMES = 300    # dupa cate cadre de absenta stergem un track din memorie
 PRUNE_CHECK_INTERVAL = 90     # la cate cadre verificam track-uri "moarte"
@@ -109,7 +176,7 @@ QUALITY_MIN = 0.30            # sub asta nu merita consumat modelul de recunoast
 
 QUALITY_WEIGHTS = {"yaw": 0.30, "pitch": 0.20, "roll": 0.10, "sharp": 0.20, "size": 0.20}
 
-VERIFY_THRESHOLD = 0.42       # prag empiric, ajustat pe baza testelor offline
+VERIFY_THRESHOLD = 0.45       # prag empiric, ajustat pe baza testelor offline
 
 AUTO_ENROLL = True
 ENROLL_MARGIN = 0.10          # banda de incertitudine sub pragul de recunoastere
@@ -123,7 +190,7 @@ ENROLL_MAX_SCORE = VERIFY_THRESHOLD - ENROLL_MARGIN
 # calibrate pe camera 1080p taiau tot pe fisierele de test. Toate se pot schimba
 # din linia de comanda (--enroll-min-face, --enroll-min-blur, ...).
 ENROLL_MIN_CHECKS = 2         # 3 cerea ~45 de cadre de track neintrerupt; nu exista
-ENROLL_MIN_FACE = 50
+ENROLL_MIN_FACE = 40
 
 # Cea mai importanta poarta pentru ce ajunge in baza, si singura care nu se poate
 # compensa. Masurat pe sample_vid.mp4: prototipurile cu frontalitate 0 au dat
@@ -156,6 +223,14 @@ ALIGN_SIZE = 112
 # pyds care nu exista in toate versiunile. Daca suprafata nu e scriptibila
 # (dGPU), se pierde tot desenul de puncte -- casetele si etichetele raman, ele
 # merg prin metadate, nu prin pixeli.
+# Landmark-urile se cer doar pentru fetele care chiar au nevoie de ele: cele care
+# dau o proba in cadrul asta, si cele ale caror track-uri inca n-au identitate
+# (acolo landmark-urile aleg prototipul, deci se cer pe fiecare cadru, ca pana
+# acum). Restul -- oameni deja recunoscuti, intre doua verificari -- raman doar
+# urmariti de tracker. Se pierde desenul punctelor pe ei; caseta si eticheta nu,
+# ele merg prin metadate.
+LANDMARK_ONLY_WHEN_NEEDED = True
+
 DRAW_ALL_LANDMARKS = True
 DRAW_OVERLAY = True        # se stinge cu --no-video: nu mai are cine sa vada desenul
 LANDMARK_RADIUS = 2
@@ -163,13 +238,30 @@ LANDMARK_RADIUS = 2
 # Culori in ordinea canalelor suprafetei (RGBA), nu normalizate: aici scriem
 # pixeli, nu completam structuri nvdsosd.
 LANDMARK_COLOR = (255, 255, 0, 255)     # setul complet, galben
-POINT_COLORS = [           # ochi stang, ochi drept, nas, gura stanga, gura dreapta
+POINT_COLORS = np.array([  # ochi stang, ochi drept, nas, gura stanga, gura dreapta
     (0, 204, 255, 255),
     (0, 204, 255, 255),
     (51, 255, 51, 255),
     (255, 102, 102, 255),
     (255, 102, 102, 255),
-]
+], dtype=np.uint8)
+
+
+def disc_offsets(radius):
+    """Deplasarile (dy, dx) ale pixelilor dintr-un disc de raza data.
+
+    Se calculeaza o data, la import: un punct desenat inseamna apoi o singura
+    scriere numpy indexata, nu un apel cv2.circle. La 106 puncte pe fata si 4
+    fete pe cadru, diferenta e intre o operatie si 424.
+    """
+    span = np.arange(-radius, radius + 1)
+    dy, dx = np.meshgrid(span, span, indexing="ij")
+    inside = dy * dy + dx * dx <= radius * radius
+    return dy[inside].ravel(), dx[inside].ravel()
+
+
+LANDMARK_DISC = disc_offsets(LANDMARK_RADIUS)
+FIVE_POINT_DISC = disc_offsets(LANDMARK_RADIUS + 1)
 BOX_COLOR_KNOWN = (0.0, 1.0, 0.0, 1.0)
 BOX_COLOR_UNCERTAIN = (1.0, 0.8, 0.0, 1.0)
 BOX_COLOR_UNKNOWN = (1.0, 0.3, 0.3, 1.0)
@@ -186,6 +278,7 @@ PROGRESS_EVERY_FRAMES = 100
 # pipeline-ul merge mai departe si umple consola cu acelasi traceback.
 
 _unmap_surface = getattr(pyds, "unmap_nvds_buf_surface", None)
+_remove_obj_meta = getattr(pyds, "nvds_remove_obj_meta_from_frame", None)
 
 _warned = set()
 
@@ -216,6 +309,13 @@ def check_pyds_api():
     if _unmap_surface is None:
         warn_once("unmap", "pyds nu are unmap_nvds_buf_surface; suprafetele nu se "
                            "elibereaza explicit (verifica memoria la rulari lungi).")
+
+    global PRETRACK_FILTER
+    if PRETRACK_FILTER and _remove_obj_meta is None:
+        PRETRACK_FILTER = False
+        warn_once("remove_obj", "pyds nu are nvds_remove_obj_meta_from_frame; "
+                                "tracker-ul va primi si casetele prea mici, deci "
+                                "rularea va fi mai lenta (rezultatele, aceleasi).")
 
 
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
@@ -351,21 +451,28 @@ class TrtModel:
             self._set_batch(count)
             flat = data.ravel()
             source["host"][:flat.size] = flat
-            cuda.memcpy_htod_async(source["device"], source["host"], self.stream)
+
+            # Se copiaza doar esantioanele cerute, nu tot bufferul alocat la batch
+            # maxim. Bufferele sunt dimensionate o data, pentru cazul cel mai rau,
+            # dar un cadru obisnuit are 4 fete si engine-urile au batch 8: fara
+            # feliile de aici se mutau de doua ori mai multi octeti decat trebuia,
+            # de doua ori pe apel (dus si intors), pe fiecare cadru.
+            cuda.memcpy_htod_async(source["device"], source["host"][:flat.size],
+                                   self.stream)
             self.context.execute_async_v2(
                 bindings=self.bindings, stream_handle=self.stream.handle
             )
+            results = []
             for entry in self.outputs:
-                cuda.memcpy_dtoh_async(entry["host"], entry["device"], self.stream)
+                view = entry["host"][: count * entry["sample_elems"]]
+                cuda.memcpy_dtoh_async(view, entry["device"], self.stream)
+                results.append((entry, view))
             self.stream.synchronize()
         finally:
             CUDA_CONTEXT.pop()
 
-        return [
-            entry["host"][: count * entry["sample_elems"]]
-                 .reshape((count,) + entry["sample_shape"]).copy()
-            for entry in self.outputs
-        ]
+        return [view.reshape((count,) + entry["sample_shape"]).copy()
+                for entry, view in results]
 
 
 # Cate fete au trecut prin fiecare model si in cate apeluri -- pentru raportul final.
@@ -500,8 +607,21 @@ class TrackState:
         self.checks = 0             # doar pentru raportul final
 
     @property
+    def resolved(self):
+        """Track-ul are deja o identitate, nu doar o banuiala.
+
+        LABEL_UNKNOWN si LABEL_UNCERTAIN nu se pun: primul inca vaneaza un
+        prototip pentru inrolare, al doilea inca poate deveni o potrivire adevarata
+        la o proba mai buna. Amandoua au nevoie de landmark-uri pe fiecare cadru.
+        """
+        return (self.current_label is not None
+                and self.current_label not in (LABEL_UNKNOWN, LABEL_UNCERTAIN))
+
+    @property
     def deadline_gap(self):
-        return RETRY_INTERVAL_ON_FAIL if self.last_check_failed else VERIFY_INTERVAL_FRAMES
+        if self.last_check_failed:
+            return RETRY_INTERVAL_ON_FAIL
+        return IDENTIFIED_INTERVAL_FRAMES if self.resolved else VERIFY_INTERVAL_FRAMES
 
     def clear_best(self):
         self.best_quality = -1.0
@@ -582,9 +702,27 @@ class FaceSample:
 # PROCESARE
 # ============================================================
 
+def crop_bgr(surface_rgba, box):
+    """Fata decupata din suprafata mapata, convertita in BGR.
+
+    Se converteste DOAR dreptunghiul fetei, nu tot cadrul. Inainte se copia
+    suprafata intreaga si se convertea RGBA->BGR pe ea (la 1080x1920: 8 MB de
+    copiat plus 14 MB de citit-scris in conversie, pe fiecare cadru), desi din ea
+    se foloseau patru bucati de cate ~43x43 px. Asta era grosul celor 24.8 ms
+    fixe pe cadru din masuratoare.
+
+    Rezultatul e un tablou nou, deci desenul de la finalul cadrului nu ajunge in
+    crop-urile deja luate -- fetele intra curate in modele.
+    """
+    x1, y1, x2, y2 = box
+    return cv2.cvtColor(surface_rgba[y1:y2, x1:x2], cv2.COLOR_RGBA2BGR)
+
+
 def blur_score(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+    # CV_32F, nu CV_64F: varianta iese aceeasi pe crop-uri de zeci de pixeli, dar
+    # se muta jumatate din octeti.
+    return float(cv2.Laplacian(gray, cv2.CV_32F).var())
 
 
 def preprocess_landmark(crop_bgr):
@@ -873,26 +1011,58 @@ def enroll_blockers(state, score, size, blur, quality, front):
 # DESEN
 # ============================================================
 
+def stamp_points(surface_rgba, points, disc, color):
+    """Deseneaza TOATE punctele deodata, printr-o singura scriere indexata.
+
+    points e (n, 2) in coordonate de cadru, color e ori o culoare RGBA, ori un
+    tablou (n, 4) cu cate una de fiecare punct. Discul e precalculat, deci aici
+    nu ramane decat o adunare cu broadcast si o masca.
+
+    Pixelii din afara cadrului se ARUNCA, nu se prind de margine: modelul de
+    landmark-uri poate scoate puncte in afara crop-ului, iar o taiere cu clip
+    le-ar aduna pe toate pe chenarul imaginii, unde n-are ce cauta niciun punct
+    facial. Asa se comporta si cv2.circle, deci desenul iese la fel ca inainte.
+    """
+    if len(points) == 0:
+        return
+    height, width = surface_rgba.shape[:2]
+    dy, dx = disc
+    centres = np.rint(points).astype(np.int32)
+    ys = centres[:, 1, None] + dy
+    xs = centres[:, 0, None] + dx
+    inside = (ys >= 0) & (ys < height) & (xs >= 0) & (xs < width)
+    if isinstance(color, np.ndarray) and color.ndim == 2:
+        # o culoare pe punct, repetata peste tot discul lui
+        color = np.broadcast_to(color[:, None, :], ys.shape + (4,))[inside]
+    surface_rgba[ys[inside], xs[inside]] = color
+
+
 def draw_landmarks(surface_rgba, faces):
-    """Punctele faciale, direct pe suprafata mapata (OpenCV).
+    """Punctele faciale, direct pe suprafata mapata.
 
     Cele 5 puncte ArcFace se deseneaza ultimele si cu raza mai mare, ca sa se
-    vada peste setul complet. Desenul nu are voie sa strice procesarea: daca
-    suprafata nu e scriptibila, se raporteaza o data si se merge mai departe --
-    recunoasterea si logul sunt oricum treaba importanta, adnotarea e doar ca sa
-    se vada. Casetele si etichetele nu se pierd: ele merg prin metadate.
+    vada peste setul complet. Punctele tuturor fetelor se aduna intr-un singur
+    tablou: inainte fiecare punct insemna un apel cv2.circle, adica 106 puncte x
+    4 fete = 424 de treceri prin bindings pe fiecare cadru, pentru cateva mii de
+    pixeli scrisi in total.
+
+    Desenul nu are voie sa strice procesarea: daca suprafata nu e scriptibila, se
+    raporteaza o data si se merge mai departe -- recunoasterea si logul sunt
+    oricum treaba importanta, adnotarea e doar ca sa se vada. Casetele si
+    etichetele nu se pierd: ele merg prin metadate.
     """
+    drawn = [face for face in faces if face.landmarks is not None]
+    if not drawn:
+        return
+
     try:
-        for face in faces:
-            if face.landmarks is None:
-                continue
-            if DRAW_ALL_LANDMARKS:
-                for x, y in face.landmarks:
-                    cv2.circle(surface_rgba, (int(x), int(y)), LANDMARK_RADIUS,
-                               LANDMARK_COLOR, -1)
-            for (x, y), color in zip(face.five_points, POINT_COLORS):
-                cv2.circle(surface_rgba, (int(x), int(y)), LANDMARK_RADIUS + 1,
-                           color, -1)
+        if DRAW_ALL_LANDMARKS:
+            stamp_points(surface_rgba,
+                         np.concatenate([face.landmarks for face in drawn]),
+                         LANDMARK_DISC, LANDMARK_COLOR)
+        stamp_points(surface_rgba,
+                     np.concatenate([face.five_points for face in drawn]),
+                     FIVE_POINT_DISC, np.tile(POINT_COLORS, (len(drawn), 1)))
     except Exception as error:      # suprafata nescriptibila / alt layout
         warn_once("surface", f"nu pot desena pe suprafata ({error}); "
                              f"raman doar casetele si etichetele.")
@@ -990,12 +1160,98 @@ class Run:
         # magistrala GStreamer care a oprit-o.
         self.failure = None
 
+        # Cate casete a scos detectorul si cate au ajuns la tracker. Diferenta e
+        # munca economisita de filtrul dinaintea lui.
+        self.detections = 0
+        self.detections_kept = 0
+        # Marimea casetelor taiate de poarta de marime, oriunde ar fi fost taiate
+        # (inainte de tracker sau in probe). Fara ele nu se poate raspunde la
+        # singura intrebare care conteaza cand baza iese goala: "cat as castiga
+        # daca as cobori pragul?" -- detaliul fiecarei casete nu se mai scrie in
+        # log, dar distributia costa o adaugare la lista si spune acelasi lucru.
+        self.rejected_sizes = []
+        # Unde se duc milisecundele din probe, insumate pe toata rularea. Fara
+        # ele, "43 ms pe cadru" nu spune ce anume sa optimizezi in continuare;
+        # perf_counter costa ~50 ns pe apel, deci masuram mereu, nu sub un flag.
+        self.stage_s = Counter()
+
 
 RUN = None
 
 # ============================================================
 # PROBE PRINCIPAL
 # ============================================================
+
+def iter_frames(gst_buffer):
+    """Cadrele din batch. Aceeasi plimbare prin lista inlantuita, o singura data."""
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            return
+        yield frame_meta
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            return
+
+
+def iter_objects(frame_meta):
+    """Obiectele unui cadru.
+
+    Nodul urmator se citeste DUPA yield, deci consumatorul nu are voie sa stearga
+    metadate in timp ce se plimba: intai se strange ce trebuie sters, abia apoi
+    se sterge (vezi detection_filter_probe).
+    """
+    l_obj = frame_meta.obj_meta_list
+    while l_obj is not None:
+        try:
+            obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+        except StopIteration:
+            return
+        yield obj_meta
+        try:
+            l_obj = l_obj.next
+        except StopIteration:
+            return
+
+
+def detection_filter_probe(pad, info, u_data):
+    """Sterge, chiar dupa detector, casetele care nu pot trece niciodata de porti.
+
+    Tracker-ul e cel mai scump element de dupa nvinfer si costa proportional cu
+    numarul de tinte: NvDCF tine cate un filtru prin corelatie pentru fiecare.
+    Masurat pe videotest3.mp4, detectorul scotea 42.2 casete pe cadru si doar 4.0
+    treceau de MIN_CONFIDENCE si MIN_FACE_SIZE -- restul erau urmarite, desenate
+    si scrise in log fara sa poata ajunge vreodata la un model.
+
+    Stergerea se face DUPA ce s-a terminat plimbarea prin lista: metadatele sunt
+    o lista inlantuita, iar nvds_remove_obj_meta_from_frame elibereaza nodul, deci
+    un l_obj.next luat dupa stergere ar citi memorie eliberata.
+    """
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+
+    for frame_meta in iter_frames(gst_buffer):
+        doomed = []
+        for obj_meta in iter_objects(frame_meta):
+            size = min(obj_meta.rect_params.width, obj_meta.rect_params.height)
+            if size < PRETRACK_MIN_SIZE:
+                doomed.append(obj_meta)
+                RUN.rejected_sizes.append(size)
+            elif obj_meta.confidence < MIN_CONFIDENCE:
+                doomed.append(obj_meta)
+
+        RUN.detections += frame_meta.num_obj_meta
+        for obj_meta in doomed:
+            _remove_obj_meta(frame_meta, obj_meta)
+        RUN.detections_kept += frame_meta.num_obj_meta
+
+    return Gst.PadProbeReturn.OK
+
 
 def media_probe(pad, info, u_data):
     gst_buffer = info.get_buffer()
@@ -1014,25 +1270,32 @@ def media_probe(pad, info, u_data):
         started = time.perf_counter()
         frame_number = frame_meta.frame_num
 
+        # Suprafata se foloseste ca atare, fara copie: din ea se decupeaza doar
+        # fetele (crop_bgr), iar tot pe ea se deseneaza la final. Copia intreaga
+        # de dinainte era cel mai scump lucru din probe si servea doar ca sa fie
+        # crop-urile curate -- dar crop_bgr scoate oricum tablouri noi, luate
+        # inainte de pasul de desen.
         surface = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
         try:
-            # Copie pentru crop-uri: pe suprafata originala desenam la final, iar
-            # crop-urile trebuie sa fie curate cand ajung la modele.
-            frame_image = cv2.cvtColor(
-                np.array(surface, copy=True, order='C'), cv2.COLOR_RGBA2BGR
-            )
-            frame_h, frame_w = frame_image.shape[:2]
-
+            frame_h, frame_w = surface.shape[:2]
             record = process_frame(frame_meta, frame_number,
-                                   frame_image, frame_w, frame_h, surface)
+                                   frame_w, frame_h, surface)
         finally:
             if _unmap_surface is not None:
                 _unmap_surface(hash(gst_buffer), frame_meta.batch_id)
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        RUN.probe_ms.append(elapsed_ms)
         record["ms"] = r(elapsed_ms, 2)
+
+        logged = time.perf_counter()
         RUN.logger.write(record)
+        log_s = time.perf_counter() - logged
+        RUN.stage_s["log"] += log_s
+
+        # In probe_ms intra si scrisul in log: ruleaza tot pe firul asta, deci tot
+        # el tine cadrul pe loc. "ms" din log ramane doar partea de procesare, ca
+        # sa se poata compara cu rularile de dinainte.
+        RUN.probe_ms.append(elapsed_ms + log_s * 1000.0)
         RUN.frames += 1
 
         if PROGRESS_EVERY_FRAMES and frame_number % PROGRESS_EVERY_FRAMES == 0:
@@ -1047,10 +1310,10 @@ def media_probe(pad, info, u_data):
     return Gst.PadProbeReturn.OK
 
 
-def process_frame(frame_meta, frame_number, frame_image,
-                  frame_w, frame_h, surface):
+def process_frame(frame_meta, frame_number, frame_w, frame_h, surface):
     """Toata logica pe un cadru. Intoarce inregistrarea pentru log."""
     pts_seconds = frame_meta.buf_pts / 1e9 if frame_meta.buf_pts else 0.0
+    started = time.perf_counter()
 
     if frame_number % PRUNE_CHECK_INTERVAL == 0:
         stale = [tid for tid, st in track_states.items()
@@ -1059,17 +1322,17 @@ def process_frame(frame_meta, frame_number, frame_image,
             del track_states[tid]
 
     # --- Pasul 1: strangem fetele vizibile, fara sa atingem GPU-ul ---
+    # Respinsele se NUMARA pe poarta, nu se scriu una cate una. Pe un cadru larg
+    # detectorul scoate zeci de casete prea mici, iar detaliul lor era 69% din
+    # log (1.9 MB din 2.7 MB pe o rulare de 711 cadre) fara sa fie citit vreodata:
+    # ce se cauta acolo e "cate si de ce", si aia ramane. Cu --log-respinse se
+    # intoarce lista intreaga, pentru cand chiar se vaneaza o caseta anume.
     faces = []
-    rejected = []
+    rejected = Counter()
+    rejected_detail = [] if LOG_REJECTED else None
     active = {}
 
-    l_obj = frame_meta.obj_meta_list
-    while l_obj is not None:
-        try:
-            obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-        except StopIteration:
-            break
-
+    for obj_meta in iter_objects(frame_meta):
         track_id = int(obj_meta.object_id)
         confidence = float(obj_meta.confidence)
         rect = obj_meta.rect_params
@@ -1081,31 +1344,42 @@ def process_frame(frame_meta, frame_number, frame_image,
         w, h = x2 - x1, y2 - y1
 
         if confidence < MIN_CONFIDENCE:
-            rejected.append({"track": track_id, "box": [x1, y1, x2, y2],
-                             "det": r(confidence), "poarta": "incredere_mica"})
+            gate = "incredere_mica"
         elif w < MIN_FACE_SIZE or h < MIN_FACE_SIZE:
-            rejected.append({"track": track_id, "box": [x1, y1, x2, y2],
-                             "det": r(confidence), "poarta": "prea_mica"})
+            gate = "prea_mica"
         else:
-            state = track_states.setdefault(track_id, TrackState())
-            state.last_seen_frame = frame_number
-            active[track_id] = state
-            report = track_reports.setdefault(
-                track_id, {"primul_cadru": frame_number, "verificari": 0,
-                           "eticheta": None, "scor": 0.0, "inrolat": False}
-            )
-            report["ultimul_cadru"] = frame_number
+            gate = None
 
-            crop = frame_image[y1:y2, x1:x2]
-            faces.append(FaceSample(track_id, state, obj_meta, crop,
-                                    blur_score(crop), min(w, h), (x1, y1, x2, y2)))
+        if gate is not None:
+            rejected[gate] += 1
+            if gate == "prea_mica":
+                RUN.rejected_sizes.append(min(w, h))
+            if rejected_detail is not None:
+                rejected_detail.append({"track": track_id, "box": [x1, y1, x2, y2],
+                                        "det": r(confidence), "poarta": gate})
+            continue
 
-        try:
-            l_obj = l_obj.next
-        except StopIteration:
-            break
+        state = track_states.setdefault(track_id, TrackState())
+        state.last_seen_frame = frame_number
+        active[track_id] = state
+        report = track_reports.setdefault(
+            track_id, {"primul_cadru": frame_number, "verificari": 0,
+                       "eticheta": None, "scor": 0.0, "inrolat": False,
+                       "marime_maxima": 0}
+        )
+        report["ultimul_cadru"] = frame_number
+        # Cat de mare a ajuns fata track-ului, oricand in viata lui. Asta arata pe
+        # loc care track-uri au fost taiate DOAR de ENROLL_MIN_FACE: unul cu
+        # marime_maxima 48 si prag 50 n-a avut nicio sansa, oricat de bine ar fi
+        # fost privit.
+        report["marime_maxima"] = max(report["marime_maxima"], min(w, h))
+
+        crop = crop_bgr(surface, (x1, y1, x2, y2))
+        faces.append(FaceSample(track_id, state, obj_meta, crop,
+                                blur_score(crop), min(w, h), (x1, y1, x2, y2)))
 
     RUN.faces_seen += len(faces)
+    RUN.stage_s["citire"] += time.perf_counter() - started
 
     # --- Pasul 2: cine cere o proba in cadrul asta ---
     # Poarta asta -- fereastra dinaintea termenului si ritmul probelor -- nu are
@@ -1119,19 +1393,36 @@ def process_frame(frame_meta, frame_number, frame_image,
         face.wants_sample = window_open and due_for_sample
 
     # --- Pasul 3: landmark-uri + aliniere + calitate, intr-un singur apel GPU ---
-    # Pe toate fetele, chiar si fara desen. Am incercat sa le cer doar pentru
-    # candidati, dar premisa s-a schimbat: landmark-urile nu mai servesc doar
-    # desenului, ci si alegerii prototipului (mai jos), iar un track poate deveni
-    # bun exact intre doua verificari -- masurat pe sample_vid.mp4, track 47 avea
-    # un singur cadru bun, la 161, intre verificarile de la 152 si 162.
-    # Costul e mic: modelul e 112x112, cu batch, si ruleaza doar pe fetele care au
-    # trecut deja de porti (149 fete in tot clipul, adica 0.3 pe cadru).
-    analyse_faces(faces)
+    # NU pe toate fetele. Un track fara identitate primeste landmark-uri pe fiecare
+    # cadru, pentru ca din ele se alege prototipul si un track poate deveni bun
+    # exact intre doua verificari (masurat pe sample_vid.mp4: track 47 avea un
+    # singur cadru bun, la 161, intre verificarile de la 152 si 162). Dar un om
+    # deja recunoscut nu mai are ce prototip sa caute: pentru el se calculeaza
+    # ceva doar cand da o proba, adica in fereastra dinaintea urmatoarei
+    # verificari. Intre timp ramane doar urmarit de tracker.
+    #
+    # Aici era grosul costului: 63% din timpul de probe se ducea pe landmark-uri,
+    # iar pe un clip cu oameni deja in baza aproape toate erau pe ei.
+    started = time.perf_counter()
+    if LANDMARK_ONLY_WHEN_NEEDED:
+        analysed = [face for face in faces
+                    if face.wants_sample or not face.state.resolved]
+    else:
+        analysed = faces
+    analyse_faces(analysed)
+    RUN.stage_s["landmark"] += time.perf_counter() - started
 
     # --- Pasul 4: statistici + prototipul, indiferent de cadenta verificarilor ---
     for face in faces:
+        # Marimea si claritatea se stiu fara GPU, deci se numara pentru toti.
         RUN.face_sizes.append(face.size)
         RUN.face_blurs.append(face.blur)
+        if face.landmarks is None:
+            # Fara landmark-uri nu exista nici calitate, nici frontalitate: ele NU
+            # se pun in distributii ca zerouri, altfel raportul ar arata o filmare
+            # din profil acolo unde de fapt n-am masurat nimic.
+            face.action = "urmarit"
+            continue
         RUN.face_qualities.append(face.quality)
         RUN.face_frontalities.append(face.frontality)
         if face.aligned is not None:
@@ -1183,7 +1474,9 @@ def process_frame(frame_meta, frame_number, frame_image,
 
     # --- Pasul 7: verificare (cine e), fara inrolare ---
     # Un singur apel GPU pentru toate fetele alese la pasul anterior.
+    started = time.perf_counter()
     embeddings = embed_aligned([state.best_aligned for _, state in to_recognize])
+    RUN.stage_s["recunoastere"] += time.perf_counter() - started
     decisions = {}
     for (track_id, state), embedding in zip(to_recognize, embeddings):
         label, score = verify_embedding(embedding)
@@ -1277,9 +1570,11 @@ def process_frame(frame_meta, frame_number, frame_image,
     # Fara video de iesire nu are cine sa vada desenul, deci nu il mai facem:
     # scutim si conversiile, si scrisul in suprafata.
     if DRAW_OVERLAY:
+        started = time.perf_counter()
         for face in faces:
             label_object(face.obj_meta, face.state)
         draw_landmarks(surface, faces)
+        RUN.stage_s["desen"] += time.perf_counter() - started
 
     # --- Pasul 10: inregistrarea pentru log ---
     face_records = []
@@ -1302,14 +1597,17 @@ def process_frame(frame_meta, frame_number, frame_image,
             entry["decizie"] = decisions[face.track_id]
         face_records.append(entry)
 
-    return {
+    record = {
         "cadru": frame_number,
         "timp": r(pts_seconds),
         "faces": face_records,
-        "respinse": rejected,
+        "respinse": dict(rejected),
         "gpu": {"landmark": len(faces), "recunoastere": len(to_recognize)},
         "identitati": len(face_database),
     }
+    if rejected_detail:
+        record["respinse_detaliu"] = rejected_detail
+    return record
 
 # ============================================================
 # PIPELINE GSTREAMER
@@ -1329,6 +1627,28 @@ def make_element(factory_names, name):
         f"Niciunul dintre elementele {factory_names} nu e disponibil "
         f"(lipseste un plugin GStreamer?)."
     )
+
+
+def make_queue(name, depth):
+    """Un queue cu limite doar pe numarul de buffere, niciodata cu pierderi.
+
+    Fara queue-uri, TOT pipeline-ul ruleaza pe un singur fir: fiecare element il
+    apeleaza direct pe urmatorul, deci cele ~43 ms petrecute in probe se adunau
+    la cele ~57 ms de decodare, detectie, urmarire si encodare in loc sa se
+    suprapuna cu ele. Un queue rupe lantul in doua fire, iar cele doua bucati
+    merg in paralel pe cadre diferite.
+
+    Limitele pe octeti si pe timp se scot, altfel se ating primele si queue-ul
+    blocheaza mai devreme decat vrem; adancimea se tine mica pentru ca fiecare
+    buffer in asteptare e o suprafata NVMM (la 1080x1920 RGBA, ~8 MB bucata).
+    Fara pierderi (leaky ramane 0): se logheaza fiecare cadru, deci un cadru
+    aruncat ar fi o gaura in raport, nu doar o imagine lipsa.
+    """
+    queue = make_element("queue", name)
+    queue.set_property("max-size-buffers", depth)
+    queue.set_property("max-size-bytes", 0)
+    queue.set_property("max-size-time", 0)
+    return queue
 
 
 def on_child_added(child_proxy, element, name, args):
@@ -1610,6 +1930,14 @@ def build_pipeline(video_path, output_video, args):
         print("  tracker: compute-hw=1 (GPU)")
 
     vidconv_osd = make_element("nvvideoconvert", "conversie-osd")
+    # Un queue nu se poate umple peste cate buffere are pool-ul elementului de
+    # dinaintea lui: cu pool-ul implicit (4), cele trei fire s-ar bloca unul pe
+    # altul si suprapunerea s-ar pierde. Proprietatea nu exista pe toate
+    # versiunile de DeepStream, deci se pune doar daca e acolo.
+    for converter in (vidconv_in, vidconv_osd):
+        if converter.find_property("output-buffers"):
+            converter.set_property("output-buffers", args.queue_size + 4)
+
     caps_rgba = make_element("capsfilter", "caps-rgba")
     caps_rgba.set_property('caps', Gst.Caps.from_string(
         "video/x-raw(memory:NVMM), format=RGBA"))
@@ -1664,10 +1992,24 @@ def build_pipeline(video_path, output_video, args):
         sink.set_property('async', False)
         tail = [nvosd, vidconv_out, caps_out, encoder, parser, muxer, sink]
 
+    # Firele de executie. Un queue inainte de conversia pentru probe si unul dupa
+    # ea taie lantul in trei bucati care merg in paralel, pe cadre diferite:
+    #
+    #   [decodare -> streammux -> detector -> tracker] | [probe] | [osd -> encoder]
+    #
+    # Probe-ul ruleaza pe firul care impinge in queue-ul de dupa caps_rgba, deci
+    # nici detectorul dinaintea lui, nici encoderul de dupa nu il mai asteapta.
+    # Asta e singura schimbare care nu atinge deloc ce se calculeaza: aceleasi
+    # cadre, aceleasi decizii, doar nu una dupa alta.
+    queue_pre = make_queue("coada-detectie", args.queue_size)
+    queue_probe = make_queue("coada-probe", args.queue_size)
+    queue_post = make_queue("coada-iesire", args.queue_size)
+
     # Lantul dupa streammux e liniar, deci se leaga in bucla: singurele legaturi
     # speciale sunt sursa (pad creat tarziu) si intrarea in streammux (pad cerut).
-    chain = [streammux, pgie, tracker, vidconv_osd, caps_rgba] + tail
-    for element in [source, vidconv_in, caps_in] + chain:
+    chain = ([streammux, pgie, tracker, queue_probe, vidconv_osd, caps_rgba,
+              queue_post] + tail)
+    for element in [source, vidconv_in, caps_in, queue_pre] + chain:
         pipeline.add(element)
 
     print("Legare elemente pipeline"
@@ -1676,7 +2018,8 @@ def build_pipeline(video_path, output_video, args):
     # uridecodebin isi creeaza pad-ul abia cand afla ce contine fisierul
     source.connect("pad-added", on_pad_added, vidconv_in)
     vidconv_in.link(caps_in)
-    caps_in.get_static_pad("src").link(streammux.get_request_pad("sink_0"))
+    caps_in.link(queue_pre)
+    queue_pre.get_static_pad("src").link(streammux.get_request_pad("sink_0"))
 
     for upstream, downstream in zip(chain, chain[1:]):
         if not upstream.link(downstream):
@@ -1684,6 +2027,13 @@ def build_pipeline(video_path, output_video, args):
                 f"Nu pot lega {upstream.get_name()} de {downstream.get_name()} "
                 f"(caps incompatibile?)."
             )
+
+    # Filtrul de casete se pune pe IESIREA detectorului, deci inainte de tracker.
+    if PRETRACK_FILTER:
+        pgie.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER,
+                                             detection_filter_probe, 0)
+        print(f"  filtru inainte de tracker: casete sub {PRETRACK_MIN_SIZE:.0f} px "
+              f"sau sub {MIN_CONFIDENCE} incredere")
 
     caps_rgba.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, media_probe, 0)
     return pipeline
@@ -1715,8 +2065,26 @@ def distribution(values, digits=1):
     }
 
 
+def tracks_above_size():
+    """Cate track-uri ating fiecare prag de marime, in jurul lui ENROLL_MIN_FACE.
+
+    Cand "marime" e blocajul principal, distributia pe fete nu ajunge: 25% din
+    fete peste prag pot fi toate ale aceluiasi om. Ce conteaza e cati OAMENI
+    diferiti au avut macar un cadru destul de mare, si asta se vede doar numarand
+    track-uri. Masurat pe videotest3.mp4: la prag 50 -> 3 track-uri, la 42 -> 9,
+    la 40 -> 13. Aceeasi filmare, acelasi model, alt prag.
+    """
+    reached = [report.get("marime_maxima", 0) for report in track_reports.values()]
+    if not reached:
+        return {}
+    steps = sorted({max(MIN_FACE_SIZE, ENROLL_MIN_FACE + delta)
+                    for delta in (-10, -8, -5, -2, 0, 5, 10)})
+    return {str(step): sum(1 for size in reached if size >= step) for step in steps}
+
+
 def write_summary(run):
     args, output_dir = run.args, run.output_dir
+    elapsed = time.time() - run.started
     durations = sorted(run.probe_ms)
     identities = {}
     for track_id, report in track_reports.items():
@@ -1745,7 +2113,32 @@ def write_summary(run):
         "cadre": run.frames,
         "fete_procesate": run.faces_seen,
         "recunoasteri": run.recognitions,
-        "durata_rulare_s": r(time.time() - run.started, 1),
+        "durata_rulare_s": r(elapsed, 1),
+        # Cat s-a mers, si cat din asta a stat pipeline-ul dupa probe. Cu
+        # queue-uri, probe-ul ruleaza in paralel cu restul, deci "probe_din_total"
+        # poate trece bine peste 100%: inseamna doar ca probe-ul e acum partea
+        # lunga si ca de el trebuie sa te legi mai departe.
+        "viteza": {
+            "fps": r(run.frames / elapsed, 2) if elapsed > 0 else 0.0,
+            "ms_pe_cadru": r(1000.0 * elapsed / run.frames, 2) if run.frames else 0.0,
+            "probe_din_total_%": (r(100.0 * sum(run.probe_ms) / (1000.0 * elapsed), 1)
+                                  if elapsed > 0 else 0.0),
+            "queue_size": args.queue_size,
+        },
+        # Cate casete a scos detectorul si cate au ajuns la tracker. Raportul
+        # dintre ele arata cat de mult ajuta filtrul de dinaintea tracker-ului --
+        # pe un cadru larg cu multa lume e diferenta intre 42 si 4 tinte urmarite.
+        "detectii": {
+            "brute": run.detections,
+            "la_tracker": run.detections_kept,
+            "aruncate": run.detections - run.detections_kept,
+            "filtru_activ": PRETRACK_FILTER,
+            "prag_px": r(PRETRACK_MIN_SIZE, 1),
+        },
+        # Unde se duc milisecundele din probe, mediu pe cadru. Aici se citeste ce
+        # merita optimizat la runda urmatoare, fara sa mai fie nevoie de profiler.
+        "timp_etape_ms": {name: r(1000.0 * total / run.frames, 2)
+                          for name, total in run.stage_s.most_common()} if run.frames else {},
         "baza_de_date": {
             "pornire": run.database_in,
             "scrisa_in": run.database_out,
@@ -1760,6 +2153,9 @@ def write_summary(run):
         "blocaje_inrolare": {
             "incercari": run.enroll_attempts,
             "cauze": dict(run.enroll_blockers.most_common()),
+            # Cate track-uri (adica oameni, nu cadre) ar ajunge la ENROLL_MIN_FACE
+            # daca pragul ar fi altul. Se citeste cand "marime" e cauza de sus.
+            "track_uri_peste_prag_marime": tracks_above_size(),
         },
         # Verificari programate care nu s-au facut deloc. Daca aici sunt numere
         # mari si "blocaje_inrolare" e gol, problema nu e la pragurile de
@@ -1772,6 +2168,10 @@ def write_summary(run):
         "apeluri_economisite": {
             "landmark": GPU_STATS["landmark_faces"] - GPU_STATS["landmark_calls"],
             "recunoastere": GPU_STATS["recognition_faces"] - GPU_STATS["recognition_calls"],
+            # Fete vazute pe care NU s-a mai cerut modelul de landmark-uri:
+            # track-ul lor avea deja identitate si nu dadea proba in cadrul acela.
+            # Raportat la "fete_procesate", asta arata cat a lucrat racirea.
+            "fete_doar_urmarite": run.faces_seen - GPU_STATS["landmark_faces"],
         },
         "timp_probe_ms": {
             "mediu": r(sum(durations) / len(durations), 2) if durations else 0.0,
@@ -1791,6 +2191,11 @@ def write_summary(run):
             # Cea mai utila dintre toate cand baza iese proasta: daca mediana e
             # langa zero, filmarea e din profil si degeaba se relaxeaza restul.
             "frontalitate": distribution(run.face_frontalities, 3),
+            # Casetele taiate de poarta de marime. Citita impreuna cu "marime_px"
+            # de mai sus, spune cat s-ar castiga coborand MIN_FACE_SIZE: daca p90
+            # de aici e mult sub prag, nu se castiga nimic, oamenii sunt pur si
+            # simplu prea departe de camera.
+            "marime_respinse_px": distribution(run.rejected_sizes, 0),
         },
         "praguri": {
             "rezolutie_lucru": f"{args.width}x{args.height}",
@@ -1804,6 +2209,8 @@ def write_summary(run):
             "QUALITY_GOOD_ENOUGH": QUALITY_GOOD_ENOUGH, "QUALITY_MIN": QUALITY_MIN,
             "ENROLL_MIN_QUALITY": ENROLL_MIN_QUALITY,
             "VERIFY_INTERVAL_FRAMES": VERIFY_INTERVAL_FRAMES,
+            "IDENTIFIED_INTERVAL_FRAMES": IDENTIFIED_INTERVAL_FRAMES,
+            "LANDMARK_ONLY_WHEN_NEEDED": LANDMARK_ONLY_WHEN_NEEDED,
         },
     }
 
@@ -1955,6 +2362,19 @@ def parse_args(argv=None):
                         help="nu scrie videoclipul adnotat: scoate encoderul si "
                              "desenul din pipeline. Prima solutie cand placa ramane "
                              "fara memorie; baza de date si logul ies neschimbate")
+    parser.add_argument("--queue-size", type=int, default=4,
+                        help="cate cadre pot astepta in fiecare queue; asta decide "
+                             "cat se suprapun decodarea/detectia, probe-ul si "
+                             "encodarea. Fiecare cadru in asteptare e o suprafata "
+                             "NVMM (~8 MB la 1080p RGBA), deci mai mult nu e "
+                             "gratis. 1 = practic fara suprapunere")
+    parser.add_argument("--no-pretrack-filter", action="store_true",
+                        help="trimite la tracker toate casetele detectorului, nu "
+                             "doar pe cele care pot trece de porti. Mult mai lent "
+                             "pe cadre largi; de folosit doar ca sa se compare")
+    parser.add_argument("--log-respinse", action="store_true",
+                        help="scrie in log fiecare caseta respinsa, nu doar cate "
+                             "au fost pe fiecare poarta (logul creste de ~4 ori)")
     parser.add_argument("--no-enroll", action="store_true",
                         help="nu adauga identitati noi in baza de date")
     parser.add_argument("--no-landmarks", action="store_true",
@@ -1983,6 +2403,16 @@ def parse_args(argv=None):
                         help=f"la cate cadre cel mult se re-verifica un track; mai "
                              f"des inseamna mai multe sanse ca un track scurt sa "
                              f"apuce ENROLL_MIN_CHECKS (implicit {VERIFY_INTERVAL_FRAMES})")
+    tuning.add_argument("--identified-interval", type=int, default=None,
+                        help=f"racirea: la cate cadre se re-verifica un track care "
+                             f"ARE deja identitate. Intre verificari nu i se mai cer "
+                             f"landmark-uri, deci asta e pargia principala de viteza "
+                             f"pe un clip cu oameni deja in baza. Mai mare = mai "
+                             f"rapid, dar un id schimbat de tracker se prinde mai "
+                             f"tarziu (implicit {IDENTIFIED_INTERVAL_FRAMES})")
+    tuning.add_argument("--landmark-all", action="store_true",
+                        help="cere landmark-uri pe toate fetele, in fiecare cadru, "
+                             "ca inainte de racire; de folosit doar ca sa se compare")
     tuning.add_argument("--min-blur", type=float, default=None,
                         help=f"varianta Laplacianului considerata 'clar' "
                              f"(implicit {MIN_BLUR})")
@@ -2011,8 +2441,10 @@ def apply_thresholds(args):
     global MIN_FACE_SIZE, MIN_BLUR, QUALITY_MIN, VERIFY_THRESHOLD
     global ENROLL_MIN_CHECKS, ENROLL_MIN_FACE, ENROLL_MIN_BLUR
     global ENROLL_MIN_QUALITY, ENROLL_MAX_SCORE, VERIFY_INTERVAL_FRAMES
-    global ENROLL_MIN_FRONTALITY
+    global ENROLL_MIN_FRONTALITY, PRETRACK_MIN_SIZE, IDENTIFIED_INTERVAL_FRAMES
 
+    if args.identified_interval is not None:
+        IDENTIFIED_INTERVAL_FRAMES = args.identified_interval
     if args.min_face is not None:
         MIN_FACE_SIZE = args.min_face
     if args.verify_interval is not None:
@@ -2033,8 +2465,9 @@ def apply_thresholds(args):
         ENROLL_MIN_QUALITY = args.enroll_min_quality
     if args.enroll_min_frontality is not None:
         ENROLL_MIN_FRONTALITY = args.enroll_min_frontality
-    # derivat, deci trebuie recalculat dupa ce se schimba pragul de verificare
+    # derivate, deci trebuie recalculate dupa pragurile de mai sus
     ENROLL_MAX_SCORE = VERIFY_THRESHOLD - ENROLL_MARGIN
+    PRETRACK_MIN_SIZE = MIN_FACE_SIZE * PRETRACK_SIZE_FACTOR
 
 
 # Pragurile in pixeli NU se scaleaza cu rezolutia de lucru, desi la un moment dat
@@ -2093,11 +2526,16 @@ def explain_inference_error(text, args):
 
 def main():
     global AUTO_ENROLL, DRAW_ALL_LANDMARKS, DRAW_OVERLAY, RUN
+    global PRETRACK_FILTER, LOG_REJECTED, LANDMARK_ONLY_WHEN_NEEDED
 
     args = parse_args()
     AUTO_ENROLL = not args.no_enroll
+    LANDMARK_ONLY_WHEN_NEEDED = not args.landmark_all
     DRAW_OVERLAY = not args.no_video
     DRAW_ALL_LANDMARKS = not args.no_landmarks and DRAW_OVERLAY
+    PRETRACK_FILTER = not args.no_pretrack_filter
+    LOG_REJECTED = args.log_respinse
+    args.queue_size = max(1, args.queue_size)
     apply_thresholds(args)
 
     check_pyds_api()
@@ -2223,13 +2661,44 @@ def main():
                 if masurat:
                     print(f"    {name}: masurat {masurat['min']}-{masurat['max']} "
                           f"(median {masurat['median']}), prag {prag}")
+            # Cate persoane s-ar castiga coborand pragul de marime. Fara asta,
+            # "marime x453" spune ca pragul taie, dar nu si daca sub el mai e
+            # cineva de prins.
+            scara = summary["blocaje_inrolare"]["track_uri_peste_prag_marime"]
+            if "marime" in blocaje["cauze"] and scara:
+                puncte = ", ".join(f"{prag}px -> {count}" for prag, count in scara.items())
+                print(f"    track-uri care ating pragul: {puncte} "
+                      f"(--enroll-min-face)")
         elif summary["fete_procesate"] == 0:
             print("  (nicio fata nu a trecut de porti: vezi 'respinse' in log)")
         if sarite:
             cauze = ", ".join(f"{name} x{count}" for name, count in sarite.items())
             print(f"  verificari sarite: {cauze}")
+        viteza = summary["viteza"]
+        print(f"  viteza:            {viteza['fps']} FPS "
+              f"({viteza['ms_pe_cadru']} ms/cadru)")
         print(f"  timp probe/cadru:  {summary['timp_probe_ms']['mediu']} ms "
-              f"(p95 {summary['timp_probe_ms']['p95']} ms)")
+              f"(p95 {summary['timp_probe_ms']['p95']} ms) = "
+              f"{viteza['probe_din_total_%']}% din rulare")
+        if summary["timp_etape_ms"]:
+            etape = ", ".join(f"{name} {value}"
+                              for name, value in summary["timp_etape_ms"].items())
+            print(f"    din care:        {etape} (ms/cadru)")
+        urmarite = summary["apeluri_economisite"]["fete_doar_urmarite"]
+        if summary["fete_procesate"]:
+            print(f"  landmark-uri:      {summary['gpu']['landmark_faces']} fete din "
+                  f"{summary['fete_procesate']} ({urmarite} doar urmarite, "
+                  f"{100 * urmarite / summary['fete_procesate']:.0f}% economisit)")
+        # Detectorul poate sa fi rulat pe cadre care n-au ajuns niciodata la probe
+        # (pipeline cazut intre tracker si conversie), deci "cadre" poate fi 0 cu
+        # detectii nenule -- de aici trebuie impartit cu grija.
+        detectii = summary["detectii"]
+        if detectii["brute"] and summary["cadre"]:
+            print(f"  detectii:          {detectii['brute'] / summary['cadre']:.1f}/cadru, "
+                  f"la tracker {detectii['la_tracker'] / summary['cadre']:.1f}/cadru")
+        elif detectii["brute"]:
+            print(f"  detectii:          {detectii['brute']} brute, "
+                  f"{detectii['la_tracker']} la tracker (niciun cadru n-a ajuns la probe)")
         free_now, _ = available_memory_mb()
         if free_now is not None:
             print(f"  memorie libera:    {free_now} MB")
