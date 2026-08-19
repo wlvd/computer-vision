@@ -387,7 +387,7 @@ ENROLL_MIN_FACE = 40
 # se umple cu intrari care nu vor recunoaste pe nimeni, niciodata. Cele cu 0.29
 # si 0.52 au dat 0.80 si 0.85. Pragul taie exact profilurile, fara sa ceara poze
 # de buletin: 40% din fetele clipului au frontalitate 0.
-ENROLL_MIN_FRONTALITY = 0.15
+ENROLL_MIN_FRONTALITY = 0.20
 ENROLL_MIN_BLUR = 80.0
 ENROLL_MIN_QUALITY = 0.35
 

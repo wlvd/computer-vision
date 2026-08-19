@@ -176,7 +176,7 @@ QUALITY_MIN = 0.30            # sub asta nu merita consumat modelul de recunoast
 
 QUALITY_WEIGHTS = {"yaw": 0.30, "pitch": 0.20, "roll": 0.10, "sharp": 0.20, "size": 0.20}
 
-VERIFY_THRESHOLD = 0.45       # prag empiric, ajustat pe baza testelor offline
+VERIFY_THRESHOLD = 0.5       # prag empiric, ajustat pe baza testelor offline
 
 AUTO_ENROLL = True
 ENROLL_MARGIN = 0.10          # banda de incertitudine sub pragul de recunoastere
